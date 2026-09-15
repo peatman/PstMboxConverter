@@ -5,13 +5,23 @@ echo Building PST to mbox Converter Executable
 echo ========================================
 echo.
 
+rem Uncomment lines below if special virtual environment is required by your python installation 
+rem if not exist "%~dp0.venv\Scripts\activate.bat" (
+rem     echo ❌ .venv not found at "%~dp0.venv".
+rem     echo    Create it first with: py -3.11 -m venv .venv
+rem     pause
+rem     exit /b 1
+rem )
+rem call "%~dp0.venv\Scripts\activate.bat"
+
+
 where python >nul 2>nul
 if errorlevel 1 (
     echo ❌ Python was not found in PATH.
     echo.
     echo Installation help:
-    echo   - Windows: https://www.python.org/downloads/windows/ (download installer, enable "Add python.exe to PATH")
-    echo   - macOS: Install via Homebrew (https://brew.sh) with "brew install python" or download from python.org
+    echo   - Windows: https://www.python.org/downloads/windows/ ^(download installer, enable "Add python.exe to PATH"^)
+    echo   - macOS: Install via Homebrew ^(https://brew.sh^) with "brew install python" or download from python.org
     echo   - Linux: Use your package manager, e.g. "sudo apt install python3 python3-pip" or visit https://wiki.python.org/moin/BeginnersGuide/Download
     echo.
     echo After installing Python, reopen this terminal and rerun build_exe.bat.
@@ -47,7 +57,8 @@ if !PY_COMBINED! GEQ 312 (
 
 echo.
 echo Installing required packages...
-python -m pip install --upgrade pyinstaller libratom
+python -m pip install libratom
+python -m pip install --upgrade pyinstaller
 
 echo.
 echo Installed package versions:
@@ -61,7 +72,7 @@ python -m pip show libratom
 
 echo.
 echo Building executable...
-pyinstaller --onefile --console --name pst-to-mbox --hidden-import libratom.lib.pff --hidden-import email.mime.multipart --hidden-import email.mime.text --hidden-import email.mime.base --clean pst_to_mbox.py
+pyinstaller --onefile --console --name pst-to-mbox --hidden-import libratom.lib.pff --hidden-import email.mime.multipart --hidden-import email.mime.text --hidden-import email.mime.base --collect-data libratom --clean pst_to_mbox.py
 
 echo.
 if exist "dist\pst-to-mbox.exe" (

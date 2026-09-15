@@ -1,44 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
 
-block_cipher = None
+datas = []
+datas += collect_data_files('libratom')
+
 
 a = Analysis(
     ['pst_to_mbox.py'],
     pathex=[],
     binaries=[],
-    datas=[('README.md', '.')],
-    hiddenimports=[
-        'libratom.lib.pff',
-        'email.mime.multipart',
-        'email.mime.text',
-        'email.mime.base',
-        'email.encoders',
-        'email.header',
-        'mailbox',
-        'pathlib',
-        'argparse',
-        'logging',
-        'time',
-        'datetime',
-        'base64'
-    ],
+    datas=datas,
+    hiddenimports=['libratom.lib.pff', 'email.mime.multipart', 'email.mime.text', 'email.mime.base'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
+    optimize=0,
 )
-
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='pst-to-mbox',

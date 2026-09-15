@@ -17,7 +17,7 @@ A Python command-line tool for converting Outlook PST files to mbox format for w
 
 ## Requirements
 
-- Python 3.6 or higher
+- Python 3.9 - 3.11 (libratom pins `numpy==1.23.5`, which has no wheels/build support for Python 3.12+ at this moment)
 - libratom library (for PST file parsing)
 
 ## Installation

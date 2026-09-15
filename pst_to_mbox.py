@@ -34,18 +34,27 @@ except ImportError:
 class PSTToMboxConverter:
     """Convert PST files to mbox format with progress tracking and error handling."""
     
-    def __init__(self, pst_file, output_file, verbose=False):
+    def __init__(self, pst_file, output_file, verbose=False, preserve_folders=False):
         """
         Initialize the converter.
         
         Args:
             pst_file (str): Path to the input PST file
-            output_file (str): Path to the output mbox file
+            output_file (str): Path to the output mbox file (or output directory
+                when preserve_folders is True)
             verbose (bool): Enable verbose logging
+            preserve_folders (bool): Write one mbox file per PST folder, mirroring
+                the folder hierarchy using Thunderbird's ".sbd" convention, instead
+                of a single flat mbox file
         """
         self.pst_file = Path(pst_file)
         self.output_file = Path(output_file)
         self.verbose = verbose
+        self.preserve_folders = preserve_folders
+        # Name of the top-level container folder used in --preserve-folders mode,
+        # so multiple PSTs with identically-named folders (Inbox, Sent Items, ...)
+        # don't collide when written into the same output directory.
+        self.pst_folder_name = self.sanitize_folder_name(self.pst_file.stem)
         self.processed_emails = 0
         self.failed_emails = 0
         self.processed_folders = 0
@@ -79,14 +88,18 @@ class PSTToMboxConverter:
         if self.pst_file.suffix.lower() not in ['.pst']:
             self.logger.warning(f"File extension is not .pst: {self.pst_file}")
         
-        # Check if output directory exists, create if not
-        self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Check if output file already exists
-        if self.output_file.exists():
-            response = input(f"Output file {self.output_file} already exists. Overwrite? (y/N): ")
-            if response.lower() not in ['y', 'yes']:
-                raise ValueError("Operation cancelled by user")
+        if self.preserve_folders:
+            # Output is a directory that will hold one mbox file per PST folder
+            self.output_file.mkdir(parents=True, exist_ok=True)
+        else:
+            # Check if output directory exists, create if not
+            self.output_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Check if output file already exists
+            if self.output_file.exists():
+                response = input(f"Output file {self.output_file} already exists. Overwrite? (y/N): ")
+                if response.lower() not in ['y', 'yes']:
+                    raise ValueError("Operation cancelled by user")
     
     def open_pst_file(self):
         """Open and validate the PST file."""
@@ -190,7 +203,7 @@ class PSTToMboxConverter:
             if sender_re:
                 sender_name = sender_re.group(1).strip('"')
                 sender_email = sender_re.group(2)
-        if sender_email == "Unknown Email":
+        if sender_email == "Unknown Email" and from_item_exists:
             sender_re = re.search(r"(\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b)", from_item)
             if sender_re:
                 sender_email = sender_re.group(1)
@@ -198,11 +211,16 @@ class PSTToMboxConverter:
                     sender_name = sender_email
 
         # Extract the timestamp from the transport header
-        timestamp ='Mon, 01 Jan 1900 00:00:00 GMT' # Default timestamp if not found
-        if date_item_exists:
-            timestamp = date_item
+        timestamp_str = 'Mon, 01 Jan 1900 00:00:00 GMT' # Default timestamp if not found
+        if date_item_exists and date_item:
+            timestamp_str = date_item
 
-        return sender_name, sender_email, timestamp   
+        try:
+            delivery_time = email.utils.parsedate_to_datetime(timestamp_str)
+        except (TypeError, ValueError):
+            delivery_time = datetime(1900, 1, 1)
+
+        return sender_name, sender_email, delivery_time   
     
     def process_from_info(self, item_from):
         """Process 'From' header item to extract name and email."""
@@ -220,11 +238,11 @@ class PSTToMboxConverter:
     
         
     def safe_get_attr(self, obj, attr, default=''):
-        """Safely get an attribute, catching Unicode decode errors from corrupted PST data."""
+        """Safely get an attribute, catching errors from corrupted PST data."""
         try:
             value = getattr(obj, attr, default)
             return value if value is not None else default
-        except (SystemError, ValueError, UnicodeDecodeError, OverflowError) as e:
+        except (SystemError, ValueError, UnicodeDecodeError, OverflowError, RuntimeError, OSError, IOError) as e:
             self.logger.debug(f"Failed to read attribute '{attr}': {e}")
             return default
 
@@ -287,9 +305,18 @@ class PSTToMboxConverter:
             msg['Subject'] = subject
             
             # start of merge-try
-            hih = HeaderItemsHelper(pst_message.transport_headers)          
+            transport_headers = self.safe_get_attr(pst_message, 'transport_headers', '') or ''
+            hih = HeaderItemsHelper(transport_headers)          
             sender_name, sender_email, delivery_time = self.extract_from_and_time_values(hih)
-            
+
+            # Many PST items (meeting responses, internal Exchange mail, etc.) have no
+            # transport headers at all; fall back to the PST-native sender_name property.
+            if sender_email == "Unknown Email":
+                pst_sender_name = self.safe_get_attr(pst_message, 'sender_name', '')
+                if pst_sender_name:
+                    sender_name = pst_sender_name
+                    sender_email = "unknown-sender@local"
+
             if (sender_email == "Unknown Email"):
                 item_from = hih.get_header_item('From') #get FROM item to check, what went wrong
                 #print(f'??????????????? From value: >>>{item_from[1] if item_from[0] else "Unknown From"}<<<')
@@ -297,7 +324,7 @@ class PSTToMboxConverter:
                 if item_from[0]:
                     self.logger.info(f"Couldn't deal with below \"FROM:\" item data in email transport header:\n{item_from[1]}")
                 else:
-                    self.logger.info(f"Couldn't find \"FROM:\" item in email transport header!")                    
+                    self.logger.debug(f"Couldn't find \"FROM:\" item in email transport header, and no sender_name available!")
             else:
                 msg['From'] = self.format_email_address(sender_email, sender_name)
                 # Set mbox unix from line for correct sender display
@@ -334,7 +361,7 @@ class PSTToMboxConverter:
                 msg['To'] = ', '.join(recipients)
             
 
-            msg['Date'] = delivery_time
+            msg['Date'] = email.utils.format_datetime(delivery_time) if delivery_time else datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z')
             ''' date handling seems to be done above already
             # Date
             delivery_time = self.safe_get_attr(pst_message, 'delivery_time', None)
@@ -373,11 +400,55 @@ class PSTToMboxConverter:
             self.logger.error(f"Failed to convert PST message: {e}")
             raise
     
+    def build_folder_paths(self, pst_archive):
+        """Build a map of message identifier -> full folder path ("Inbox/Sub/...")
+        using the archive's internal tree, since PST messages don't carry a
+        direct reference back to their containing folder."""
+        folder_paths = {}
+        tree = pst_archive.tree
+        for node in tree.all_nodes():
+            if node.data is None:
+                continue  # folder node, not a message
+
+            ancestor_ids = list(tree.rsearch(node.identifier))[1:-1]  # drop message itself and root
+            ancestor_ids.reverse()  # top-level folder first, immediate parent last
+            folder_names = [tree.get_node(nid).tag for nid in ancestor_ids]
+            folder_paths[node.identifier] = "/".join(folder_names) if folder_names else "Unknown"
+
+        return folder_paths
+
+    @staticmethod
+    def sanitize_folder_name(name):
+        """Strip characters that aren't valid in Windows/mbox file names."""
+        name = re.sub(r'[<>:"/\\|?*]', '_', name).strip()
+        return name or "Unnamed"
+
+    def folder_path_to_mbox_path(self, base_dir, folder_path):
+        """Map a PST folder path to an on-disk mbox file path, using Thunderbird's
+        ".sbd" convention for subfolders (e.g. "Inbox/CRT" -> Inbox.sbd/CRT).
+        Each PST's tree is nested under a top-level mbox "folder" named after the
+        source PST (see process_messages_preserving_folders), so multiple PSTs can
+        be written into the same output directory without their identically-named
+        folders (Inbox, Sent Items, ...) colliding, and Thunderbird shows the PST
+        name as a real parent folder rather than an opaque directory."""
+        segments = [s for s in folder_path.split('/') if s]
+        if len(segments) > 1:
+            segments = segments[1:]  # drop the synthetic top-level PST container
+        segments = [self.sanitize_folder_name(s) for s in segments] or ["Unknown"]
+        segments = [self.pst_folder_name] + segments
+
+        path = Path(base_dir)
+        for segment in segments[:-1]:
+            path = path / f"{segment}.sbd"
+        return path / segments[-1]
+
     def process_messages(self, pst_archive, mbox_file):
         """Process all messages in the PST archive."""
         try:
             self.logger.info("Processing messages from PST archive...")
-            
+
+            folder_paths = self.build_folder_paths(pst_archive)
+
             # Use libratom's messages() generator to iterate through all messages
             message_count = 0
             for pst_message in pst_archive.messages():
@@ -392,13 +463,9 @@ class PSTToMboxConverter:
                 '''
 
                 try:
-                    # Get folder path if available
-                    folder_path = "Unknown"
-                    try:
-                        if hasattr(pst_message, 'folder') and pst_message.folder:
-                            folder_path = self.safe_get_attr(pst_message.folder, 'name', 'Unknown')
-                    except (SystemError, ValueError, UnicodeDecodeError, OverflowError):
-                        pass
+                    folder_path = folder_paths.get(
+                        self.safe_get_attr(pst_message, 'identifier', None), "Unknown"
+                    )
                     
                     email_msg = self.convert_pst_message_to_email(pst_message, folder_path)
                     mbox_file.add(email_msg)
@@ -416,6 +483,64 @@ class PSTToMboxConverter:
         
         except Exception as e:
             self.logger.error(f"Failed to process messages: {e}")
+
+    def process_messages_preserving_folders(self, pst_archive, output_dir):
+        """Process all messages, writing one mbox file per PST folder so mail
+        clients like Thunderbird show the original folder hierarchy."""
+        try:
+            self.logger.info("Processing messages from PST archive (preserving folder structure)...")
+
+            folder_paths = self.build_folder_paths(pst_archive)
+            mbox_files = {}
+
+            # Create an empty mbox file for the top-level PST container itself, so
+            # Thunderbird displays it as a real (if empty) parent folder rather than
+            # ignoring the plain "<name>.sbd" directory holding its children.
+            top_container = Path(output_dir) / self.pst_folder_name
+            if not top_container.exists():
+                top_container.parent.mkdir(parents=True, exist_ok=True)
+                mailbox.mbox(str(top_container)).close()
+
+            def get_mbox(folder_path):
+                mbox_path = self.folder_path_to_mbox_path(output_dir, folder_path)
+                key = str(mbox_path)
+                if key not in mbox_files:
+                    mbox_path.parent.mkdir(parents=True, exist_ok=True)
+                    mbox_obj = mailbox.mbox(str(mbox_path))
+                    mbox_obj.lock()
+                    mbox_files[key] = mbox_obj
+                return mbox_files[key]
+
+            message_count = 0
+            try:
+                for pst_message in pst_archive.messages():
+                    try:
+                        folder_path = folder_paths.get(
+                            self.safe_get_attr(pst_message, 'identifier', None), "Unknown"
+                        )
+                        email_msg = self.convert_pst_message_to_email(pst_message, folder_path)
+                        get_mbox(folder_path).add(email_msg)
+                        self.processed_emails += 1
+                        message_count += 1
+
+                        if self.processed_emails % 100 == 0:
+                            self.logger.info(f"Processed {self.processed_emails} emails...")
+
+                    except Exception as e:
+                        self.failed_emails += 1
+                        self.logger.error(f"Failed to process message {message_count}: {e}")
+
+                self.logger.info(f"Finished processing {message_count} messages across {len(mbox_files)} folders")
+            finally:
+                for mbox_obj in mbox_files.values():
+                    try:
+                        mbox_obj.flush()
+                    finally:
+                        mbox_obj.unlock()
+                        mbox_obj.close()
+
+        except Exception as e:
+            self.logger.error(f"Failed to process messages: {e}")
     
     def convert(self):
         """Main conversion process."""
@@ -430,25 +555,33 @@ class PSTToMboxConverter:
             # Open PST file
             pst_archive = self.open_pst_file()
             
-            # Create mbox file
-            mbox_file = mailbox.mbox(str(self.output_file))
-            mbox_file.lock()
-            
-            try:
-                # Process all messages
-                self.process_messages(pst_archive, mbox_file)
+            if self.preserve_folders:
+                self.process_messages_preserving_folders(pst_archive, self.output_file)
+            else:
+                # Create mbox file
+                mbox_file = mailbox.mbox(str(self.output_file))
+                mbox_file.lock()
                 
-                # Flush and close mbox file
-                mbox_file.flush()
-                
-            finally:
-                mbox_file.unlock()
-                mbox_file.close()
+                try:
+                    # Process all messages
+                    self.process_messages(pst_archive, mbox_file)
+                    
+                    # Flush and close mbox file
+                    mbox_file.flush()
+                    
+                finally:
+                    mbox_file.unlock()
+                    mbox_file.close()
             
             # Calculate statistics
             end_time = time.time()
             duration = end_time - start_time
-            output_size = self.output_file.stat().st_size if self.output_file.exists() else 0
+            if self.preserve_folders:
+                output_size = sum(
+                    f.stat().st_size for f in self.output_file.rglob('*') if f.is_file()
+                ) if self.output_file.exists() else 0
+            else:
+                output_size = self.output_file.stat().st_size if self.output_file.exists() else 0
             
             # Print final statistics
             self.logger.info("\n" + "="*50)
@@ -483,6 +616,7 @@ Examples:
   %(prog)s input.pst output.mbox
   %(prog)s -v /path/to/outlook.pst /path/to/emails.mbox
   %(prog)s --verbose "C:\\Users\\Name\\Documents\\Outlook.pst" "emails.mbox"
+  %(prog)s --preserve-folders input.pst output_folder
         """
     )
     
@@ -493,13 +627,21 @@ Examples:
     
     parser.add_argument(
         'output_file',
-        help='Path to the output mbox file'
+        help='Path to the output mbox file (or output directory when --preserve-folders is used)'
     )
     
     parser.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose output'
+    )
+    
+    parser.add_argument(
+        '--preserve-folders',
+        action='store_true',
+        help='Write one mbox file per PST folder, mirroring the folder hierarchy '
+             '(Thunderbird ".sbd" layout) in the output_file directory, instead of '
+             'a single flat mbox file'
     )
     
     parser.add_argument(
@@ -511,7 +653,7 @@ Examples:
     args = parser.parse_args()
     
     # Create converter and run conversion
-    converter = PSTToMboxConverter(args.pst_file, args.output_file, args.verbose)
+    converter = PSTToMboxConverter(args.pst_file, args.output_file, args.verbose, args.preserve_folders)
     
     try:
         success = converter.convert()
